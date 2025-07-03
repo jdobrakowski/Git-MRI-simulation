@@ -68,33 +68,45 @@ def popraw_wiersz_do_sredniej(wiersz, j, bandwidth, B0_real):
 
     return przesun_sygnal(wiersz, np.mean(B0_real), np.mean(B), DT)
 
-
+#B0_data_path = '/Users/jandobrakowski/Documents/Studia/Pomiary 30 czerwca/Grad Echo 30 czerwca Z 10-15-kopia.csv'
 B0_data_path = '/Users/jandobrakowski/Documents/Studia/Pomiary 30 czerwca/Grad Echo 30 czerwca Y 10-16 -kopia.csv'
 import_real_B0_field(B0_data_path)
 
 
 #B0_dt = (9.948490583E0 - 1.130729169E-2)/1000#pomiar XY nr 5
 B0_dt = (9.956118042E0-1.823466690E-2)/1000 #Pomiar Y nr 16
+#B0_dt = (9.952965625E0-1.555450028E-2)/1000 #Pomiar Z nr 14
 
-kolejnosc_wierszy = [16, 15, 17, 14, 18, 13, 19, 12, 20, 11, 21, 10, 22, 9,23, 8,24,7,25,6,26,5,27,4,28,3,29,2,30,1,31,0] #tablica przechowująca indeksy wierszy w k_space w kolejnosci ich zapisywania przez MRI
-czas_wiersza = np.copy(kolejnosc_wierszy)
-for i in range(32):
-    czas_wiersza[kolejnosc_wierszy[i]] = i
+#kolejnosc_wierszy = [16, 15, 17, 14, 18, 13, 19, 12, 20, 11, 21, 10, 22, 9,23, 8,24,7,25,6,26,5,27,4,28,3,29,2,30,1,31,0] #tablica przechowująca indeksy wierszy w k_space w kolejnosci ich zapisywania przez MRI
+# czas_wiersza = np.copy(kolejnosc_wierszy)
+# for i in range(32):
+#     czas_wiersza[kolejnosc_wierszy[i]] = i
 
 polarization_ends = [] #tablica z indeksami momentów końca czasu polaryzacji
 #polarization_ends.append(3972) #pomiar5
 #polarization_ends.append(1111) #pomiar4
+
+#Poniższe dane należy przepisać z pliku acqu.par
 N = 32
 TE = 300*1e-3
-bandwidth = 16
+t_grad = 50*1e-3#pomiar Z nr 14 i Y nr 16
+#bandwidth = 32 #Pomiar Z nr 14
+bandwidth = 16 #Pomiar Y nr 16
 t_read = N/bandwidth
 t_read_probki = t_read/B0_dt
-t_delay = TE + 50*1e-3
+t_delay = t_grad + 70*1e-3
 t_delay_probki = t_delay//B0_dt
-print(t_read_probki)
+# print("B0_dt = ", B0_dt)
+# print(t_read)
+# print(t_delay_probki)
 
-polarization_ends.append(16055)#pomiar nr 16
+# plt.plot(Voxel.B0_real)
+# plt.show()
+# plt.clf()
 
+#Poniższą liczbę należy odczytać z powyższego wykresu pola Voxel.B0_real
+polarization_ends.append(16055)#pomiar Y nr 16
+#polarization_ends.append(9808)#pomiar Z nr 14
 """
 for i in range(32):
     polarization_ends.append(polarization_ends[-1]+ 808)
@@ -110,11 +122,7 @@ for i in range(N-1):
 
 B0_real = []
 #plt.figure(figsize=(10, 6)) # Możesz dostosować rozmiar wykresu
-"""
-plt.plot(Voxel.B0_real)
-plt.show()
-plt.clf()
-"""
+
 for i in polarization_ends:
     #plt.axvline(x=num*96, color='red', linestyle='--', linewidth=1.5)
     for j in time_points:
@@ -129,7 +137,7 @@ for i in polarization_ends:
 odchyl_stand = np.std(B0_real)
 print("Odchylenie standardowe: ", odchyl_stand)
 B0_rand = np.random.randn(len(B0_real))
-B0_rand = B0_rand*odchyl_stand #+ np.mean(B0_real)/4
+B0_rand = B0_rand*odchyl_stand + np.mean(B0_real)
 
 
 # plt.plot(B0_real)
@@ -159,8 +167,10 @@ B0 = np.mean(B0_real)
 #plt.show()
 
 print(N)
-k_space = load_k_space_to_matrix("/Users/jandobrakowski/Documents/Studia/Pomiary 30 czerwca/PomiarY numer 16.txt")
-k_space_popr = popraw_wiersz_k_space(k_space, 0, bandwidth,N, B0_rand)
+k_space = load_k_space_to_matrix("/Users/jandobrakowski/Documents/Studia/Pomiary 30 czerwca/PomiarY numer 16.txt") #pomiar Y nr 16
+#k_space = load_k_space_to_matrix("/Users/jandobrakowski/Documents/Studia/Pomiary 30 czerwca/Pomiar Z numer 14.txt")#pomiar Z nr 14
+k_space_popr = popraw_wiersz_k_space(k_space, 0, bandwidth,N, B0_real)
+window_1D = np.hamming(N)
 obraz1D_popr = np.fft.fft(k_space_popr)
 obraz1D_popr_shifted = np.fft.fftshift(obraz1D_popr)
 obraz1D = np.fft.fft(k_space)
@@ -184,8 +194,8 @@ for i in range(0,32):
 fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 im1 = axes[0].plot(freqs_shifted,np.abs(obraz1D_shifted))
 im1 = axes[1].plot(freqs_shifted,np.abs(obraz1D_popr_shifted))
-axes[0].set_title('surowy obraz')
-axes[1].set_title('poprawiony wg losowego B0 obraz')
+axes[0].set_title('surowy obraz pomiary Grad Echo Y nr 16')
+axes[1].set_title('poprawiony wg zmierzonego B0')
 plt.show()
 
 """
