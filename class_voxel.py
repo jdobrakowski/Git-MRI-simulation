@@ -10,6 +10,7 @@ from tqdm import tqdm
 import os
 import webbrowser
 from matplotlib import rcParams
+from scipy.signal import decimate
 rcParams['animation.embed_limit'] = 100  # Limit w MB (np. 100 MB)
 
 """
@@ -19,15 +20,15 @@ Czyli kazdą pętlę po wokselach mogę dzzielić na rdzenia procesora.
 
 class Voxel:
     #Parametry ogólne
-    FOVx = 5.6*1e-2 #maksymalny rozmiar fantomu w osi x w metrach (Field of view)
-    FOVy = 5.6*1e-2 #maksymalny rozmiar fantomu w osi y w metrach (Field of view)
+    FOVx = 7.3*1e-2 #maksymalny rozmiar fantomu w osi x w metrach (Field of view)
+    FOVy = 7.3*1e-2 #maksymalny rozmiar fantomu w osi y w metrach (Field of view)
 
     #Stała żyromagnetyczna
     gammaHz = 42.58 * 1e6  # w jednostkach Hz/T
     gammaRad = 2.675 * 1e8  # w jednostkach rad/(s*T)
 
     #Wartość stałego pola magnetycznego
-    B0 = 60*1e-6 # Średnia wartość B_z w Teslach. 
+    B0 = 41*1e-6 # Średnia wartość B_z w Teslach. 
 
     #Gęstość voxeli
     dx = 0.5*1e-2 #Wartość w metrach.
@@ -46,8 +47,11 @@ class Voxel:
     stage = []
     B0_real = []
     B0_data_dt = 0.009938000003
-   
-    def __init__(self, x, y, z, proton_density, t1, t2, t2_star, m0=0.015):
+    """
+    Czas trwania gradient echo w osi y to 0.0045s (i nie skaluje się wraz Nx)
+    Czas trwania gradient echo w osi x to 0.0150s (dla Nx = 100 i skaluje się proporcjonalnie do Nx)
+    """
+    def __init__(self, x, y, z, proton_density, t1, t2, t2_star, m0=0.015, chemical_shift=0.0):
         self.x = x
         self.y = y
         self.z = z
@@ -56,6 +60,7 @@ class Voxel:
         self.T2 = t2
         self.T2_star = t2_star
         self.M0 = m0 * proton_density
+        self.chemical_shift = chemical_shift
         self.magnetization = np.array([0.0, 0.0, self.M0])# Przechowywanie aktualnego stanu magnetyzacji (Mx, My, Mz)
         self.B = np.array([0.0, 0.0, 0.0]) # Na początku zawsze pole magnetyczne w miejscu woksela wynosi 0
         self.previous_B = np.array([0.0, 0.0, 0.0]) # pole magnetyczne B w poprzedniej iteracji
@@ -71,10 +76,25 @@ class Voxel:
     def change_magnetization_to(self, M):
         self.magnetization = M
 
-def precession(voxels_set, global_time): #Wykonuje precesję magnetyzacji woksela w zadanym polu magnetycznym o czas dt
-    def f(M, B, M0, T1, T2, gammaHz):
+    def get_position(self):
+        return (self.x, self.y, self.z)
+
+def precession(voxels_set): #Wykonuje precesję magnetyzacji woksela w zadanym polu magnetycznym o czas dt
+    """
+    Korzystam z metody Rungego-Kutty 4 rzędu
+
+    dM/dt = f(t, M, B)
+    na wiki f(x, y)
+    y = M(t) - szukana funkcja 
+    na wiki h = dx. Czyli w naszym przypadku h = Voxel.dt
+
+    Tylko, ze na wikipedii y jest jawną funkcją czasu, a u mnie jest raczej f(M(t), B(t)), czyli t jest uwikłana w M i B
+
+    """
+    #@jit(nopython=True)
+    def f(M, B, M0, T1, T2, gammaRad):
         M_cross_B = np.cross(M, B)  # Moment magnetyczny z precesji
-        result = gammaHz * M_cross_B  # Jeszcze bez relaksacji
+        result = gammaRad * M_cross_B  # Jeszcze bez relaksacji
         result[0] -= M[0]/T2  # Zanikanie Mx
         result[1] -= M[1]/T2  # Zanikanie My
         result[2] -= (M[2]-M0)/T1
@@ -82,11 +102,10 @@ def precession(voxels_set, global_time): #Wykonuje precesję magnetyzacji woksel
 
     for voxel in voxels_set.values():  
         M = voxel.magnetization
-        B = voxel.B + np.array([0., 0., dB_noise_function(global_time)]) #dodaję szum do pola B
+        B = voxel.B #+ np.array([0., 0., dB_noise_function(global_time)]) #dodaję szum do pola B
         previous_B = voxel.previous_B
         T1 = voxel.T1
         T2 = voxel.T2
-        #Korzystam z metody Rungego-Kutty 4 rzędu
         k1 = Voxel.dt * f(M, previous_B, voxel.M0, T1, T2, Voxel.gammaRad)
         k2 = Voxel.dt * f(M + 0.5 * k1, (B+previous_B)/2, voxel.M0, T1, T2, Voxel.gammaRad)
         k3 = Voxel.dt * f(M + 0.5 * k2, (B+previous_B)/2, voxel.M0, T1, T2, Voxel.gammaRad)
@@ -98,9 +117,12 @@ def precession(voxels_set, global_time): #Wykonuje precesję magnetyzacji woksel
         voxel.change_magnetization_to(M_new)
 
 def non_relaxation_precession(voxels_set): #Wykonuje precesję magnetyzacji woksela bez relaksacji
+    """
+    Uzywam metody Eulera, aby sprawdzić poprawność Rungego-Kutty.
+    """
     for voxel in voxels_set.values():  
         M = voxel.magnetization
-       
+        # 1. Połowa kroku precesji (aktualizacja komponentów magnetyzacji)
         M_cross_B = np.cross(M, voxel.B)  # Moment magnetyczny z precesji
         M_new = M + Voxel.gammaRad * M_cross_B * Voxel.dt 
                       
@@ -164,6 +186,13 @@ def fast_long_precession(voxels_set, T):
     for i, voxel in enumerate(voxels_set.values()):
         voxel.magnetization = magnetization[i]
 
+def reset_magnetization(voxels):
+    """
+    Resetuje magnetyzację wszystkich wokseli do ich początkowego stanu.
+    """
+    for voxel in voxels.values():
+        Mz_eq = voxel.proton_density  # Magnetyzacja w równowadze zależna od gęstości protonów
+        voxel.change_magnetization_to(0, 0, Mz_eq)
 
 #Widok na ustalona płaszczyzne stałego z
 def show_slice_in_z(voxels_set, z_fixed):
@@ -174,6 +203,25 @@ def show_slice_in_z(voxels_set, z_fixed):
     voxels_xy = {(x, y): value for (x, y, z), value in voxels_set.items() if z == z_fixed}
 
     return voxels_xy
+
+    # Ustawienia osi i tytuł wykresu
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z',
+            aspectratio=dict(x=1, y=1, z=1)
+        ),
+        title='Interaktywny model 3D fantomu z wektorami magnetyzacji',
+        width=700,
+        height=700
+        )
+    
+    # Wyświetlenie wykresu
+    fig.show()
+
+#pokazuje magnetyzację wokseli danego fantomu w płaszczyźnie XY oraz XZ w czasie
+
 
 def show_fantom_time_3d(voxels_set,n, xlim, ylim, zlim, speed): 
     """
@@ -279,11 +327,128 @@ def show_fantom_time_3d(voxels_set,n, xlim, ylim, zlim, speed):
     print("Animacja zapisana jako HTML: fantom_animation_two_planes.html")
     plt.clf()
 
+#ponizsza funkcja na razie nie moze działać! Bo usuwam przetrzymywanie historii magnetyzacji
+#pokazuje magnetyzację wokseli danego fantomu w płaszczyźnie z
+def show_fantom_time(voxels_set, z_fixed, n):  # n - co n klatek jest zapisany snapshot
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    import os
+    from IPython.display import HTML
+    import webbrowser
+
+    # Najpierw ograniczenie zbioru wokseli do ustalonej płaszczyzny
+    voxels = show_slice_in_z(voxels_set, z_fixed)  # Ucięte w odpowiedniej osi
+    dt = Voxel.dt
+
+    # Tworzenie figury i wykresu 2D
+    fig, ax = plt.subplots(figsize=(3, 3))
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_title('Obracanie się magnetyzacji')
+    ax.set_aspect('equal', adjustable='box')  # Zachowanie proporcji osi
+
+    # Inicjalizacja wektorów
+    vectors = []
+    for voxel in voxels.values():
+        vector = ax.quiver(voxel.x, voxel.y, 1, 0, angles='xy', scale_units='xy', scale=1)
+        vectors.append({
+            'vector': vector,
+            'position': np.array((voxel.x, voxel.y)),
+            'history': voxel.magnetization_history,  # Historia magnetyzacji voxela
+        })
+
+    # Dodanie tekstu wyświetlającego numer klatki
+    frame_text = ax.text(0.05, 0.95, '', transform=ax.transAxes, fontsize=12, verticalalignment='top')
+
+    # Funkcja animująca
+    def animate(frame_index):
+        i = frame_index * n
+        for vec in vectors:
+            if i + 1 < len(vec['history']):
+                # Aktualizacja końcówki wektora w oparciu o aktualną magnetyzację
+                end_position = vec['history'][i]
+                dx, dy = end_position[0], end_position[1]
+
+                # Aktualizacja wektora: od bazy do końca
+                vec['vector'].set_UVC(dx, dy)  # Ustawienie końca wektora względem początku
+                vec['vector'].set_offsets(vec['position'])  # Podstawa wektora pozostaje stała
+
+        # Aktualizacja tekstu z numerem klatki
+        frame_text.set_text(f'Time: {i * dt * 1000:.2f} ms')
+
+        return [v['vector'] for v in vectors] + [frame_text]
+
+    # Tworzenie animacji, liczba klatek zależy od co n-tej wartości
+    max_frames = len(vectors[0]['history']) // n - 1
+    ani = FuncAnimation(fig, animate, frames=max_frames, interval=50, blit=True)
+
+    html_content = ani.to_jshtml()
+
+    # Dodanie JavaScriptu do zmiany rozmiaru kontrolera
+    resized_html = f"""
+    <div style="width: 600px; height: 600px; transform: scale(1); transform-origin: top left; margin: 0 auto;">
+        {html_content}
+    </div>
+    <script>
+        // Czekaj, aż kontroler zostanie wygenerowany
+        window.onload = function() {{
+            let controls = document.querySelector(".animation-controls");
+            if (controls) {{
+                controls.style.transform = "scale(1.5)";  // Powiększ kontroler
+                controls.style.transformOrigin = "top left";  // Punkt skalowania kontrolera
+                controls.style.marginTop = "10px";  // Odstęp między kontrolerem a animacją
+            }}
+        }};
+    </script>
+    """
+
+    # Zapisanie do pliku HTML
+    with open("fantom_animation.html", "w") as f:
+        f.write(resized_html)
+
+    output_file = "fantom_animation.html"
+    webbrowser.open(f"file://{os.path.abspath(output_file)}")
+    print("Animacja zapisana jako HTML: fantom_animation.html")
+    #plt.show()
+
+def no_background_RF_signal(voxels_set, frequency, time_length, amplitude, n_snapshots):
+    iterator = 0
+    for t in np.arange(0.,time_length, Voxel.dt):
+        Bx = 2 * amplitude * np.cos(-2*np.pi*frequency * t)
+        By = 0.
+        Bz = Voxel.B0
+        B = np.array([Bx, By, Bz])
+       
+        for voxel in voxels_set.values():
+            voxel.previous_B = voxel.B
+            voxel.B = B
+
+        non_relaxation_precession(voxels_set)
+        for voxel in voxels_set.values():
+            if iterator %n_snapshots == 0:
+                voxel.magnetization_snapshots.append(voxel.magnetization)
+                stage = "Sygnał RF " + str(np.round(frequency, 2)) + "hz"
+                Voxel.stage.append(stage)
+                voxel.B_snapshots.append(voxel.B)
+                #print(10*voxel.magnetization)
+
+        iterator += 1
+
 def generate_RF_signal(voxels_set, frequency, time_length, amplitude, n_snapshots):
     """
     Sygnał RF w przeciwieństwie do gradientów, działa przez pewien ustalony czas (wykonując precesję w czasie)
 
     Działa takze na pewnym ustalonym tle, do którego tylko "dodaje" sygnał w osi x
+
+    frequency*T = 2 * pi
+
+    freq_xz = gamma*amplitude_RF
+    freq_xz * T90 = pi/2
+
+    czyli T90 = pi/(2*gamma*amplitude_RF)
     """
     dt = Voxel.dt
     iterator = 0
@@ -297,8 +462,20 @@ def generate_RF_signal(voxels_set, frequency, time_length, amplitude, n_snapshot
             voxel.previous_B = voxel.B
             voxel.B += B
 
-        precession(voxels_set, t)
+        
+        """
+        DEBUG
 
+        voksel = voxels_set[(0.004, 0.004, 0.006)]
+        if iterator %n_snapshots == 0:
+            print("magnetyzacja voxela (x,y,z) = ", voksel.x, voksel.y, voksel.z, "wynosi: ", voksel.magnetization)
+            print("Pole magnetyczne: ", voksel.B)
+            print("Czas: ", f'{t*1000*n_snapshots:.2f}', "ms")
+        """
+
+        precession(voxels_set)
+
+        
         if iterator %n_snapshots == 0:
             stage = "Sygnał RF " + str(np.round(frequency, 2)) + "hz"
             Voxel.stage.append(stage)
@@ -311,6 +488,50 @@ def generate_RF_signal(voxels_set, frequency, time_length, amplitude, n_snapshot
         
         iterator += 1
         
+def generate_uniform_field(voxels_set, B):
+    """
+    Generuje stałe pole B w obrębie podanego fantomu voxels_set w aktualnym czasie
+    
+    B musi być postaci np.array(Bx, By, Bz)
+    """
+    dt = Voxel.dt
+    last_moment = Voxel.actual_time
+
+    Voxel.actual_time += dt
+    stage = "Pole B = " + str(np.round(B*1e6,2)) + "μT"
+    Voxel.stage.append(stage)
+    for voxel in voxels_set.values():
+        voxel.B = B
+
+#Impuls RF pi/2 
+def rf_pi_half(voxels_set, T, T90, B1, B_history_file):
+    T = Voxel.T
+    T90 = Voxel.T90
+    
+    freq_pi_half = 1/T # Częstotliwość w Hz, typowa dla ziemskiego pola magnetycznego i stałej gamma wodoru
+    generate_RF_signal(freq_pi_half, T90, voxels_set, B1)
+
+# Wybór warstwy Z sygnałem RF. Raczej tego nie uzywam w zaawansowanych funkcjach
+def slice_selection_by_gradient(voxels_set, slice_z, Gzz, amplitude):
+    # Muszę puścić gradient w osi z i pobudzić do precesji tylko wybrana warstwę
+    dt = Voxel.dt
+    gamma = Voxel.gamma
+    last_moment = Voxel.actual_time
+    B0 = Voxel.B0
+    frequency = gamma*(B0 + Gzz*slice_z*B0)
+    time_length = np.pi/(2*(gamma*amplitude))
+
+    for t in np.arange(last_moment, last_moment + time_length, dt):
+        Bx = 2*amplitude * np.cos(-frequency * t)
+        By = 0.
+        Voxel.actual_time = t
+        stage = "Sygnał RF " + str(np.round(frequency, 2)) + "hz"
+        Voxel.stage.append(stage)
+        for voxel in voxels_set.values():
+            Bz = B0 + Gzz*voxel.z*B0
+            voxel.B = np.array((Bx, By, Bz))#Tworzę historię z sygnałem RF
+        precession(voxels_set)
+
 def gradient(voxels_set, Gx, Gy, Gz):#ustawia aktualny stan pola z gradientami w x, y, z
     """
     Poniewaz gradienty nie zmieniają się tak dynamicznie, jak syngał RF, oraz są wykorzystywane w czasie pomiarów, to
@@ -318,10 +539,178 @@ def gradient(voxels_set, Gx, Gy, Gz):#ustawia aktualny stan pola z gradientami w
 
     Ta funkcja jest niezalezna od czasu. Niejako ustawia tło do innych działań (podobnie zresztą do shimmingu)
     """
+    B0 = Voxel.B0
     for voxel in voxels_set.values():
-        B = np.array([0.0, 0.0, Gz*voxel.z + Voxel.B0 + Gy*voxel.y + Gx*voxel.x])   
+        B = np.array([0.0, 0.0, Gz*voxel.z + B0 + Gy*voxel.y + Gx*voxel.x])   
         voxel.B = B
         voxel.previous_B = B
+        #print("Pole B w punkcie (x,y,z) = ", voxel.x, voxel.y, voxel.z, "wynosi: ", B)
+
+def create_single_voxel_fantom(voxels_set, x, y, z):
+    """
+    Dodaje pojedynczy voxel z domyślnymi wartościami do istniejącego zbioru voxelów.
+
+    Args:
+        voxels_set (dict): Istniejący zbiór voxelów.
+        x (float): Pozycja x voxela.
+        y (float): Pozycja y voxela.
+        z (float): Pozycja z voxela.
+
+    Returns:
+        dict: Zaktualizowany zbiór voxelów zawierający nowy voxel.
+    """
+
+    # Parametry voxela
+    proton_density = 1.0  # Gęstość protonów
+    t1 = 200 * 1e-3  # Czas relaksacji T1
+    t2 = 80 * 1e-3  # Czas relaksacji T2
+    t2_star = 70 * 1e-3  # Czas relaksacji T2*
+
+    # Tworzenie voxela
+    voxel = Voxel(
+        x=x, y=y, z=z,
+        proton_density=proton_density,
+        t1=t1,
+        t2=t2,
+        t2_star=t2_star
+    )
+
+    # Dodanie voxela do zbioru voxelów
+    voxels_set[(x, y, z)] = voxel
+
+    return voxels_set
+
+def create_line(N):
+    """
+    Tworzy linię voxelów wzdłuż osi Z o długości N.
+
+    Args:
+        N (int): Liczba voxelów w linii.
+
+    Returns:
+        dict: Słownik zawierający voxel dla każdej pozycji w linii.
+    """
+    # Słownik voxelów dla linii
+    line_voxels = {}
+    z_positions = np.arange(1, 2*N+1, 2)
+    # Generowanie linii wzdłuż osi Z
+    for z in z_positions:
+        # Dodajemy każdy voxel jako element linii
+        line_voxels[(0, 0, z)] = Voxel(
+            x=0,                # Stała pozycja w X
+            y=0,                # Stała pozycja w Y
+            z=z * Voxel.dz,     # Pozycja w Z uwzględniająca rozdzielczość dz
+            proton_density=1.0, # Stała gęstość protonów dla linii
+            t1=500,             # Przykładowe czasy relaksacji
+            t2=100,
+            t2_star=70
+        )
+
+    return line_voxels
+
+#Definicja fantomu - sześcian
+def create_cube(N):
+    """
+    Tworzy sześcian voxelów o rozmiarze N x N x N.
+
+    Args:
+        N (int): Rozmiar siatki fantomu.
+
+    Returns:
+        dict: Słownik zawierający voxel dla każdej pozycji w sześcianie.
+    """
+    # Słownik voxelów dla sześcianu
+    cube_voxels = {}
+
+    # Generowanie sześcianu o wymiarach N x N x N
+    for i in range(N):
+        for j in range(N):
+            for k in range(N):
+                # Dodajemy każdy voxel jako element sześcianu
+                x=i * Voxel.dx + Voxel.FOVx/2 - N*Voxel.dx/2  # Uwzględniamy rozdzielczość (dx, dy, dz)
+                y=j * Voxel.dy+ Voxel.FOVy/2 - N*Voxel.dy/2
+                z=k * Voxel.dz+ Voxel.FOVy/2 - N*Voxel.dz/2
+                #print(x, y, z)
+                cube_voxels[(x, y, z)] = Voxel(
+                    x=x,  
+                    y=y,
+                    z=z,
+                    proton_density=1, # Stała gęstość protonów dla sześcianu
+                    t1=400*1e-3,  # Przykładowe czasy relaksacji (możesz dostosować)
+                    t2=100*1e-3,
+                    t2_star=80*1e-3
+                )
+    return cube_voxels
+
+#Definicja Fantomu jabłka
+def create_apple(diameter_apple, diameter_seed):
+    """
+    Tworzy fantom jabłka z miąższem i pestkami jako zbiór voxelów.
+
+    Args:
+        diameter_apple (float): Średnica jabłka w jednostkach rzeczywistych (np. m).
+        diameter_seed (float): Średnica pestek w jednostkach rzeczywistych (np. m).
+
+    Returns:
+        dict: Słownik voxelów, gdzie kluczami są współrzędne (x, y, z), 
+              a wartościami są obiekty klasy Voxel.
+    """
+    dx = Voxel.dx  # Rozdzielczość z klasy Voxel w metrach
+    N = int(diameter_apple / dx)  # Liczba voxelów wzdłuż jednej osi
+    center_x, center_y, center_z = N // 2, N // 2, N // 2  # Środek jabłka
+
+    radius_apple = diameter_apple / 2  # Promień jabłka w jednostkach rzeczywistych (m)
+    radius_seed = diameter_seed / 2  # Promień pestek w jednostkach rzeczywistych (m)
+
+    # Słownik voxelów, gdzie kluczami są współrzędne (x, y, z)
+    apple_voxels = {}
+
+    # Dodajemy voxele dla jabłka (miąższu)
+    for x in range(N):
+        for y in range(N):
+            for z in range(N):
+                real_x = x * dx
+                real_y = y * dx
+                real_z = z * dx
+                distance_to_center = np.sqrt((real_x - center_x * dx)**2 + (real_y - center_y * dx)**2 + (real_z - center_z * dx)**2)
+                if distance_to_center <= radius_apple:
+                    # Dodajemy voxel miąższu
+                    apple_voxels[(real_x, real_y, real_z)] = Voxel(
+                        real_x, real_y, real_z, 
+                        proton_density=0.9,  # Gęstość protonów w miąższu
+                        t1=1000*1e-3,  # Przykładowe czasy relaksacji dla miąższu
+                        t2=80*1e-3,
+                        t2_star=50*1e-3
+                    )
+
+    # Dodajemy voxele dla pestek
+    seeds_centers = [
+        (center_x * dx + 0.005, center_y * dx, center_z * dx),
+        (center_x * dx - 0.005, center_y * dx, center_z * dx),
+        (center_x * dx, center_y * dx + 0.005, center_z * dx),
+        (center_x * dx, center_y * dx - 0.005, center_z * dx)
+    ]
+
+    for seed_center in seeds_centers:
+        seed_x, seed_y, seed_z = seed_center
+        for x in range(N):
+            for y in range(N):
+                for z in range(N):
+                    real_x = x * dx
+                    real_y = y * dx
+                    real_z = z * dx
+                    distance_to_seed = np.sqrt((real_x - seed_x)**2 + (real_y - seed_y)**2 + (real_z - seed_z)**2)
+                    if distance_to_seed <= radius_seed:
+                        # Dodajemy voxel pestki
+                        apple_voxels[(real_x, real_y, real_z)] = Voxel(
+                            real_x, real_y, real_z, 
+                            proton_density=0.5,  # Gęstość protonów w pestkach
+                            t1=800*1e-3,  # Przykładowe czasy relaksacji dla pestek
+                            t2=60*1e-3,
+                            t2_star=40*1e-3
+                        )
+
+    return apple_voxels
 
 def show_S_image(S, TR, TE, T_RF,  Nx, Ny, sampling_frequency):
     Gx = 30/(Voxel.FOVx*Voxel.gammaRad*0.002)
@@ -545,13 +934,159 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
     
     return S
 
-def import_real_B0_field():
+import cmath
+
+import cmath
+
+def load_k_space_to_matrix(file_path):
+    """
+    Wczytuje dane z pliku tekstowego do macierzy liczb zespolonych (listy list)
+    lub jednowymiarowej listy liczb zespolonych, w zależności od formatu danych.
+    Automatycznie wykrywa separator (spacja lub przecinek).
+
+    Każdy wiersz w pliku odpowiada wierszowi macierzy (dla formatu 2D) lub
+    kolejnemu elementowi macierzy jednowymiarowej (dla formatu z czasem).
+
+    Dla parzystej liczby elementów w wierszu:
+        Dane są w parach: (część rzeczywista, część urojona). Reprezentuje wiersz 2D macierzy.
+    Dla nieparzystej liczby elementów (dokładnie 3 w pierwszym wierszu):
+        Pierwszy element w każdym wierszu jest pomijany (traktowany jako czas).
+        Kolejne dwie liczby to (część rzeczywista, część urojona) k_space.
+        W tym przypadku wszystkie wiersze reprezentują kolejne elementy JEDNOWYMIAROWEJ macierzy.
+
+    Args:
+        file_path (str): Ścieżka do pliku tekstowego.
+
+    Returns:
+        list of list of complex: Macierz 2D zawierająca wczytane liczby zespolone
+                                 LUB list of complex: Lista 1D zawierająca wczytane liczby zespolone.
+                                 Zwraca pustą listę, jeśli plik jest pusty.
+    Raises:
+        FileNotFoundError: Jeśli plik pod podaną ścieżką nie istnieje.
+        ValueError: Jeśli dane w pliku nie mogą być przekonwertowane na liczby
+                    zmiennoprzecinkowe, format danych jest niespójny lub nie można
+                    wykryć poprawnego separatora.
+    """
+    matrix = []
+    is_1d_format = False
+    detected_separator = None # Zmienna do przechowywania wykrytego separatora
+    
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+
+            if not lines:
+                return [] # Pusty plik
+
+            # --- Wykrywanie separatora na podstawie pierwszego niepustego wiersza ---
+            first_valid_line = None
+            for line in lines:
+                stripped_line = line.strip()
+                if stripped_line:
+                    first_valid_line = stripped_line
+                    break
+            
+            if not first_valid_line: # Plik zawiera tylko puste linie
+                return []
+
+            elements_space = [e for e in first_valid_line.split(' ') if e]
+            elements_comma = [e for e in first_valid_line.split(',') if e]
+
+            if len(elements_space) > len(elements_comma) and len(elements_space) > 0:
+                detected_separator = ' '
+            elif len(elements_comma) > len(elements_space) and len(elements_comma) > 0:
+                detected_separator = ','
+            elif len(elements_space) > 0: # Jeśli mają tyle samo lub tylko spacje
+                 detected_separator = ' '
+            elif len(elements_comma) > 0: # Jeśli mają tyle samo lub tylko przecinki
+                 detected_separator = ','
+            else:
+                raise ValueError("Nie można wykryć separatora (spacja lub przecinek) w pierwszym wierszu lub wiersz jest pusty.")
+
+            # --- Ustalenie formatu (1D z czasem czy 2D) na podstawie pierwszego wiersza ---
+            if detected_separator == ' ':
+                first_line_elements_str = elements_space
+            else: # detected_separator == ','
+                first_line_elements_str = elements_comma
+            
+            if len(first_line_elements_str) % 2 != 0:
+                if len(first_line_elements_str) == 3:
+                    is_1d_format = True
+                else:
+                    raise ValueError(
+                        f"Błąd w linii 1: Nieparzysta liczba elementów ({len(first_line_elements_str)}). "
+                        "Oczekiwano parzystej liczby dla 2D k-space lub dokładnie 3 dla 1D k-space z czasem."
+                    )
+            # -------------------------------------------------------------------
+
+            for line_num, line in enumerate(lines, 1):
+                stripped_line = line.strip()
+                if not stripped_line:
+                    continue # Pomijamy puste linie
+
+                # Używamy wykrytego separatora dla wszystkich linii
+                elements_str = [e for e in stripped_line.split(detected_separator) if e]
+
+                if is_1d_format:
+                    # Format 1D: pierwszy element to czas (pomijamy), kolejne dwa to k_space
+                    if len(elements_str) != 3:
+                        raise ValueError(
+                            f"Błąd w linii {line_num}: Niespójna liczba elementów dla formatu 1D. "
+                            f"Oczekiwano 3 elementów (czas, rzeczywista, urojona), znaleziono {len(elements_str)}."
+                        )
+                    
+                    # Czas jest pomijany: time_str = elements_str[0]
+                    real_str = elements_str[1]
+                    imag_str = elements_str[2]
+
+                    try:
+                        real_part = float(real_str)
+                        imag_part = float(imag_str)
+                        matrix.append(complex(real_part, imag_part)) # Dodajemy do płaskiej listy
+                    except ValueError:
+                        raise ValueError(
+                            f"Błąd konwersji danych w linii {line_num}: "
+                            f"'{real_str}' lub '{imag_str}' nie jest poprawną liczbą zmiennoprzecinkową."
+                        )
+                else:
+                    # Format 2D: parzysta liczba elementów (rzeczywista, urojona)
+                    if len(elements_str) % 2 != 0:
+                        raise ValueError(
+                            f"Błąd w linii {line_num}: Nieparzysta liczba elementów ({len(elements_str)}) dla formatu 2D. "
+                            "Liczby zespolone wymagają par (rzeczywista, urojona)."
+                        )
+                    
+                    row = []
+                    # Iterujemy co dwa elementy, aby wziąć parę (rzeczywista, urojona)
+                    for i in range(0, len(elements_str), 2):
+                        real_str = elements_str[i]
+                        imag_str = elements_str[i+1]
+                        
+                        try:
+                            real_part = float(real_str)
+                            imag_part = float(imag_str)
+                            row.append(complex(real_part, imag_part)) # Tworzymy liczbę zespoloną
+                        except ValueError:
+                            raise ValueError(
+                                f"Błąd konwersji danych w linii {line_num}: "
+                                f"'{real_str}' lub '{imag_str}' nie jest poprawną liczbą zmiennoprzecinkową."
+                            )
+                    matrix.append(row)
+
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Plik nie znaleziony pod ścieżką: {file_path}")
+    except Exception as e:
+        raise ValueError(f"Wystąpił nieoczekiwany błąd podczas wczytywania pliku: {e}")
+    
+    return matrix
+
+def import_real_B0_field(file_path):
     """
     importuje plik .csv z rzeczywistym polem B0
     """
     import pandas as pd
     # Importowanie danych z pliku CSV
-    data = pd.read_csv('B0_field.csv')
+    data = pd.read_csv(file_path)
     B0_real = data["Absolute field (µT)"]
     Voxel.B0_real = B0_real[100:]#usuwam pierwsze 100 elementów, poniewaz roznia sie znaczaco or reszty
     Voxel.B0_real = Voxel.B0_real.reset_index(drop=True)
@@ -642,11 +1177,12 @@ def gradient_echo_y_axis(voxels_set, T_RF, Ny, flip_angle, slice_z, Gzz, samplin
     print("Czas trwania sekwencji: ", T_grad_y + T_RF + DT)
     return S
 
-def gradient_echo_x_axis(voxels_set, T_RF, Nx, flip_angle, slice_z, Gzz, sampling_frequency):
-    T_read = Nx/sampling_frequency
+def gradient_echo_x_axis(voxels_set, T_RF, Nx, flip_angle, slice_z, Gzz, sampling_frequency, bandwidth, FOVx):
+    T_read = Nx/(bandwidth)
     S = np.zeros(Nx, dtype=complex)
     frequency_RF = Voxel.gammaHz*(Voxel.B0 + Gzz*slice_z)
-    Gx = (sampling_frequency/2 - Voxel.B0*Voxel.gammaHz)/(Voxel.FOVx*Voxel.gammaHz*1.1)
+    print("Częstotliwość RF = ", frequency_RF)
+    Gx = bandwidth/(FOVx*Voxel.gammaHz)
     amplitude_RF = flip_angle/(2*np.pi*Voxel.gammaHz * T_RF)#Dobrane tak, aby obrót był o flip_angle
     T_dephase = T_read/2
     coil_area = np.pi * (Voxel.coil_radius**2)  # Powierzchnia cewki
@@ -659,39 +1195,38 @@ def gradient_echo_x_axis(voxels_set, T_RF, Nx, flip_angle, slice_z, Gzz, samplin
     #show_snapshot_3d(voxels_set, z_fixed=slice_z, y_fixed=0.004)Co o
     
     gradient(voxels_set, -Gx, 0., 0.)#gradient defazujący w osi x
-    
-    for t in np.arange(0., T_dephase, Voxel.dt):
-        precession(voxels_set, t + T_RF)
+    # licznik = 0
+    fast_long_precession(voxels_set, T_dephase)
+    # for t in np.arange(0.,T_dephase, Voxel.dt):
+    #     # for i, voxel in enumerate(voxels_set.values()):
+    #     #     if i < 5: # Ogranicz do pierwszych 5 vokseli dla testu
+    #     #         print(f"Voxel {i}: M = {voxel.magnetization}, B = {voxel.B}, previous_B = {voxel.previous_B}")
+    #     precession(voxels_set, t + T_RF)
+    #     licznik += 1
+    #     if licznik%100000 == 0:
+    #         print("Ukończono ", f"{t/(T_read+ T_RF + T_dephase)*100:.2f}", "% obliczeń")
+    print("Here I Am!")
+    #fast_long_precession(voxels_set, T_dephase)
 
     gradient(voxels_set, Gx, 0., 0.)#Gradienty refazujące (w osi x) 
-    
-
     ### Zaczynamy pomiar!
-    total_flux = np.zeros(int(T_read/Voxel.dt)+1)
-    
-    licznik = 0
-    for t in np.arange(0., T_read, Voxel.dt):
-        precession(voxels_set, t + T_dephase + T_RF)
+    DT = 1/sampling_frequency
+    V = np.zeros(int(T_read / DT), dtype=complex)
+    t = 0.0
+    for i in range(int(T_read/DT)): #teraz idziemy po kolejnych próbkach
+        total_flux = np.zeros(2)
         for voxel in voxels_set.values():
-            total_flux[licznik] += voxel.magnetization[0]*coil_area#sumuje składowe x magnetyzacji
-        licznik += 1
-    
-    V = -np.gradient(total_flux, Voxel.dt)  # Użycie kroku czasowego jako odstępu
-    V[len(V)-1] = 0 #ostatni element ustawiam sztucznie, bo nie ma następnego momentu czasu
-    V[len(V)-2] = 0 #same
-    #plt.plot(np.arange(len(V)), V)
-    #plt.show()
+            total_flux[0] += voxel.magnetization[0]*coil_area#sumuje składowe x magnetyzacji
+        precession(voxels_set)
+        t += Voxel.dt
+        for voxel in voxels_set.values():
+            total_flux[1] += voxel.magnetization[0]*coil_area#sumuje składowe x magnetyzacji
+        V[i] = -np.gradient(total_flux, Voxel.dt)[0]*np.exp(-2j*np.pi*Voxel.gammaHz*Voxel.B0*i*DT)
+        while(t < (i+1)*DT):
+            precession(voxels_set)
+            t += Voxel.dt
 
-    #próbkowanie V
-    DT = T_read/Nx
-    print("DT: ", DT)
-    for i in range(Nx): #teraz mając FID idziemy po kolejnych t_x i aktualizujemy je
-        # Zaktualizuj wartość w przestrzeni k-space
-        if int(i*DT/Voxel.dt) == len(V):
-            break
-        else:
-            S[i] += V[int(i*DT/Voxel.dt)] 
-
+    S = decimate(V, int(len(V)/Nx))
     return S
 
 def gaussian(x, a, x0, sigma):
@@ -728,172 +1263,6 @@ def fit_gaussian_to_peaks(image,x, peaks):
             fit_params.append(None)
     return fit_params
 
-#funkcje generujące różne rodzaje fantomów
-def create_single_voxel_fantom(voxels_set, x, y, z):
-    """
-    Dodaje pojedynczy voxel z domyślnymi wartościami do istniejącego zbioru voxelów.
-
-    Args:
-        voxels_set (dict): Istniejący zbiór voxelów.
-        x (float): Pozycja x voxela.
-        y (float): Pozycja y voxela.
-        z (float): Pozycja z voxela.
-
-    Returns:
-        dict: Zaktualizowany zbiór voxelów zawierający nowy voxel.
-    """
-
-    # Parametry voxela
-    proton_density = 1.0  # Gęstość protonów
-    t1 = 200 * 1e-3  # Czas relaksacji T1
-    t2 = 80 * 1e-3  # Czas relaksacji T2
-    t2_star = 70 * 1e-3  # Czas relaksacji T2*
-
-    # Tworzenie voxela
-    voxel = Voxel(
-        x=x, y=y, z=z,
-        proton_density=proton_density,
-        t1=t1,
-        t2=t2,
-        t2_star=t2_star
-    )
-
-    # Dodanie voxela do zbioru voxelów
-    voxels_set[(x, y, z)] = voxel
-
-    return voxels_set
-
-def create_line(N):
-    """
-    Tworzy linię voxelów wzdłuż osi Z o długości N.
-
-    Args:
-        N (int): Liczba voxelów w linii.
-
-    Returns:
-        dict: Słownik zawierający voxel dla każdej pozycji w linii.
-    """
-    # Słownik voxelów dla linii
-    line_voxels = {}
-    z_positions = np.arange(1, 2*N+1, 2)
-    # Generowanie linii wzdłuż osi Z
-    for z in z_positions:
-        # Dodajemy każdy voxel jako element linii
-        line_voxels[(0, 0, z)] = Voxel(
-            x=0,                # Stała pozycja w X
-            y=0,                # Stała pozycja w Y
-            z=z * Voxel.dz,     # Pozycja w Z uwzględniająca rozdzielczość dz
-            proton_density=1.0, # Stała gęstość protonów dla linii
-            t1=500,             # Przykładowe czasy relaksacji
-            t2=100,
-            t2_star=70
-        )
-
-    return line_voxels
-
-def create_cube(N):
-    """
-    Tworzy sześcian voxelów o rozmiarze N x N x N.
-
-    Args:
-        N (int): Rozmiar siatki fantomu.
-
-    Returns:
-        dict: Słownik zawierający voxel dla każdej pozycji w sześcianie.
-    """
-    # Słownik voxelów dla sześcianu
-    cube_voxels = {}
-
-    # Generowanie sześcianu o wymiarach N x N x N
-    for i in range(N):
-        for j in range(N):
-            for k in range(N):
-                # Dodajemy każdy voxel jako element sześcianu
-                x=i * Voxel.dx + Voxel.FOVx/2 - N*Voxel.dx/2  # Uwzględniamy rozdzielczość (dx, dy, dz)
-                y=j * Voxel.dy+ Voxel.FOVy/2 - N*Voxel.dy/2
-                z=k * Voxel.dz+ Voxel.FOVy/2 - N*Voxel.dz/2
-                #print(x, y, z)
-                cube_voxels[(x, y, z)] = Voxel(
-                    x=x,  
-                    y=y,
-                    z=z,
-                    proton_density=1, # Stała gęstość protonów dla sześcianu
-                    t1=400*1e-3,  # Przykładowe czasy relaksacji (możesz dostosować)
-                    t2=100*1e-3,
-                    t2_star=80*1e-3
-                )
-    return cube_voxels
-
-def create_apple(diameter_apple, diameter_seed):
-
-    """
-    Tworzy fantom jabłka z miąższem i pestkami jako zbiór voxelów.
-
-    Args:
-        diameter_apple (float): Średnica jabłka w jednostkach rzeczywistych (np. m).
-        diameter_seed (float): Średnica pestek w jednostkach rzeczywistych (np. m).
-
-    Returns:
-        dict: Słownik voxelów, gdzie kluczami są współrzędne (x, y, z), 
-              a wartościami są obiekty klasy Voxel.
-    """
-    dx = Voxel.dx  # Rozdzielczość z klasy Voxel w metrach
-    N = int(diameter_apple / dx)  # Liczba voxelów wzdłuż jednej osi
-    center_x, center_y, center_z = N // 2, N // 2, N // 2  # Środek jabłka
-
-    radius_apple = diameter_apple / 2  # Promień jabłka w jednostkach rzeczywistych (m)
-    radius_seed = diameter_seed / 2  # Promień pestek w jednostkach rzeczywistych (m)
-
-    # Słownik voxelów, gdzie kluczami są współrzędne (x, y, z)
-    apple_voxels = {}
-
-    # Dodajemy voxele dla jabłka (miąższu)
-    for x in range(N):
-        for y in range(N):
-            for z in range(N):
-                real_x = x * dx
-                real_y = y * dx
-                real_z = z * dx
-                distance_to_center = np.sqrt((real_x - center_x * dx)**2 + (real_y - center_y * dx)**2 + (real_z - center_z * dx)**2)
-                if distance_to_center <= radius_apple:
-                    # Dodajemy voxel miąższu
-                    apple_voxels[(real_x, real_y, real_z)] = Voxel(
-                        real_x, real_y, real_z, 
-                        proton_density=0.9,  # Gęstość protonów w miąższu
-                        t1=1000*1e-3,  # Przykładowe czasy relaksacji dla miąższu
-                        t2=80*1e-3,
-                        t2_star=50*1e-3
-                    )
-
-    # Dodajemy voxele dla pestek
-    seeds_centers = [
-        (center_x * dx + 0.005, center_y * dx, center_z * dx),
-        (center_x * dx - 0.005, center_y * dx, center_z * dx),
-        (center_x * dx, center_y * dx + 0.005, center_z * dx),
-        (center_x * dx, center_y * dx - 0.005, center_z * dx)
-    ]
-
-    for seed_center in seeds_centers:
-        seed_x, seed_y, seed_z = seed_center
-        for x in range(N):
-            for y in range(N):
-                for z in range(N):
-                    real_x = x * dx
-                    real_y = y * dx
-                    real_z = z * dx
-                    distance_to_seed = np.sqrt((real_x - seed_x)**2 + (real_y - seed_y)**2 + (real_z - seed_z)**2)
-                    if distance_to_seed <= radius_seed:
-                        # Dodajemy voxel pestki
-                        apple_voxels[(real_x, real_y, real_z)] = Voxel(
-                            real_x, real_y, real_z, 
-                            proton_density=0.5,  # Gęstość protonów w pestkach
-                            t1=800*1e-3,  # Przykładowe czasy relaksacji dla pestek
-                            t2=60*1e-3,
-                            t2_star=40*1e-3
-                        )
-
-    return apple_voxels
-
 def create_XZ_fantom(a, b):#Tworzy fantom jako plaster a x b wycentrowany w płaszczyźnie XZ
     # Słownik voxelów 
     XZ_voxels = {}
@@ -914,92 +1283,6 @@ def create_XZ_fantom(a, b):#Tworzy fantom jako plaster a x b wycentrowany w pła
                 t2_star=80*1e-3
             )
     return XZ_voxels
-
-def generate_ball(diameter, Px, Py, Pz):
-    """
-    Generuje fantom 3D składający się z kuli
-    
-    Zwraca:
-        fantom (dict): Mapa 3D voxelów { (x,y,z): Voxel }
-    """
-    # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
-    Voxel.dx = Voxel.FOVx / Px
-    Voxel.dy = Voxel.FOVy / Py
-    Voxel.dz = Voxel.FOVy / Pz  # Przyjmujemy FOVz = FOVy
-
-    # Tworzenie siatki 3D
-    x_vals = np.arange(0.0, Voxel.FOVx, Voxel.dx)
-    y_vals = np.arange(0.0, Voxel.FOVy, Voxel.dy)
-    z_vals = np.arange(0.0, Voxel.FOVy, Voxel.dz)
-
-    # Definiowanie kul
-    center = (x_vals[Px//2], y_vals[Py//2], z_vals[Pz//2])  # Środek kuli
-    radius = diameter/2# Promien kuli
-
-    # Wartości T1, T2, rho dla obu kul
-    T1, T2, rho = 300, 100, 1.0
-
-    # Inicjalizacja mapy voxelowej
-    fantom = {}
-
-    # Wypełnianie fantomu voxelami
-    for x in x_vals:
-        for y in y_vals:
-            for z in z_vals:
-                # Obliczanie odległości od środków kul
-                dist = np.sqrt((x - center[0])**2 + (y - center[1])**2 + (z - center[2])**2)
-
-                if dist <= radius:
-                    voxel = Voxel(x, y, z, rho, T1, T2, T2)  # T2* = T2 jako uproszczenie
-                    fantom[(x, y, z)] = voxel
-            
-    return fantom
-
-def generate_two_balls(size):
-    """
-    Generuje fantom 3D składający się z dwóch kul o różnych właściwościach T1, T2 i gęstości protonowej (rho).
-    
-    Zwraca:
-        fantom (dict): Mapa 3D voxelów { (x,y,z): Voxel }
-    """
-    # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
-    Voxel.dx = Voxel.FOVx / size
-    Voxel.dy = Voxel.FOVy / size
-    Voxel.dz = Voxel.FOVy / size  # Przyjmujemy FOVz = FOVy
-
-    # Tworzenie siatki 3D
-    x_vals = np.arange(-Voxel.FOVx / 2, Voxel.FOVx / 2, Voxel.dx)
-    y_vals = np.arange(-Voxel.FOVy / 2, Voxel.FOVy / 2, Voxel.dy)
-    z_vals = np.arange(-Voxel.FOVy / 2, Voxel.FOVy / 2, Voxel.dz)
-
-    # Definiowanie kul
-    center1 = (0.01, 0.01, 0.0)  # Środek pierwszej kuli
-    center2 = (-0.01, -0.01, 0.0)  # Środek drugiej kuli
-    radius1, radius2 = 0.01, 0.015  # Promienie kul
-
-    # Wartości T1, T2, rho dla obu kul
-    T1_1, T2_1, rho_1 = 300, 100, 1.0
-    T1_2, T2_2, rho_2 = 500, 200, 0.6
-
-    # Inicjalizacja mapy voxelowej
-    fantom = {}
-
-    # Wypełnianie fantomu voxelami
-    for x in x_vals:
-        for y in y_vals:
-            for z in z_vals:
-                # Obliczanie odległości od środków kul
-                dist1 = np.sqrt((x - center1[0])**2 + (y - center1[1])**2 + (z - center1[2])**2)
-                dist2 = np.sqrt((x - center2[0])**2 + (y - center2[1])**2 + (z - center2[2])**2)
-
-                if dist1 <= radius1:
-                    voxel = Voxel(x, y, z, rho_1, T1_1, T2_1, T2_1)  # T2* = T2 jako uproszczenie
-                    fantom[(x, y, z)] = voxel
-                elif dist2 <= radius2:
-                    voxel = Voxel(x, y, z, rho_2, T1_2, T2_2, T2_2)
-                    fantom[(x, y, z)] = voxel
-
-    return fantom
 
 def show_snapshot_3d(voxels_set, z_fixed, y_fixed):
     """
@@ -1169,17 +1452,19 @@ def show_T2_rho_fantom_2d(voxels_set, z_fixed, atol=1e-1):
     plt.tight_layout()
     plt.show()
 
-def show_rho_2D(fantom, z_fixed,Nx, Ny, atol=1e-1):
+def show_rho_2D(fantom, z_fixed,Nx, Ny):
     # Tworzenie siatki wartości gęstości protonowej
-    x_min, x_max = 0.0, Voxel.FOVx
-    y_min, y_max = 0.0, Voxel.FOVy
-    x_range = np.arange(x_min, x_max + x_max/Nx, x_max/Nx)
-    y_range = np.arange(y_min, y_max + y_max/Ny, y_max/Ny)
+    x_min, x_max = -Voxel.FOVx/2, Voxel.FOVx/2
+    y_min, y_max = -Voxel.FOVy/2, Voxel.FOVy/2
+    Voxel.dx =  Voxel.FOVx/Nx
+    Voxel.dy =  Voxel.FOVy/Ny
+    x_range = np.arange(-Voxel.FOVx/2, Voxel.FOVx/2, Voxel.dx)
+    y_range = np.arange(-Voxel.FOVy/2, Voxel.FOVy/2, Voxel.dy)
     rho_grid = np.zeros((len(y_range), len(x_range)))
 
     for voxel in fantom.values():
-        x_idx = int((voxel.x - x_min) / (x_max/Nx))
-        y_idx = int((voxel.y - y_min) / (y_max/Ny))
+        x_idx = int((voxel.x - x_min) / Voxel.dx)
+        y_idx = int((voxel.y - y_min) / Voxel.dy)
         rho_grid[y_idx, x_idx] = voxel.proton_density
 
     # Tworzenie wizualizacji ρ
@@ -1190,6 +1475,177 @@ def show_rho_2D(fantom, z_fixed,Nx, Ny, atol=1e-1):
     plt.ylabel('Y (m)')
     plt.colorbar(label='ρ')
     plt.show()
+
+def generate_circle(radius, center_x, center_y, Nx, Ny):
+    """
+    Generuje fantom 2D (koło w płaszczyźnie XY) składający się z voxeli.
+    Wszystkie voxele mają współrzędną z = 0.
+
+    Args:
+        radius (float): Promień koła.
+        center_x (float): Współrzędna X środka koła.
+        center_y (float): Współrzędna Y środka koła.
+        Nx (int): Liczba voxeli w osi X w całym polu widzenia.
+        Ny (int): Liczba voxeli w osi Y w całym polu widzenia.
+
+    Returns:
+        fantom (dict): Mapa 2D/3D voxeli { (x,y,z): Voxel }, gdzie z zawsze wynosi 0.
+    """
+    # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
+    # Zakładamy, że Voxel.FOVx i Voxel.FOVy są zdefiniowane i reprezentują
+    # rozmiar całego obszaru, w którym generowane są voxele.
+    center_x -= Voxel.FOVx/2
+    center_y -= Voxel.FOVy/2 #przesuwamy wszystko tak, aby do obliczeń było wycentrowane w (0, 0)
+
+    Voxel.dx = Voxel.FOVx / Nx
+    Voxel.dy = Voxel.FOVy / Ny
+    Voxel.dz = 0.01  # Ustawiamy małą, stałą wartość, aby voxele miały minimalną "głębokość",
+                    # ale faktycznie koło będzie płaskie na z=0
+
+    # Tworzenie siatki 2D wycentrowane w (0,0) (dla Z bierzemy tylko 0)
+    x_vals = np.arange(-Voxel.FOVx/2, Voxel.FOVx/2, Voxel.dx)
+    y_vals = np.arange(-Voxel.FOVy/2, Voxel.FOVy/2, Voxel.dy)
+    z_val = 0.0 # Koło jest w płaszczyźnie z=0
+
+    # Wartości T1, T2, rho dla voxeli koła
+    T1, T2, rho = 300* 1e-3, 100* 1e-3, 1.0
+
+    # Inicjalizacja mapy voxelowej
+    fantom = {}
+
+    # Wypełnianie fantomu voxelami
+    for x in x_vals:
+        for y in y_vals:
+            # Obliczanie odległości od środka koła w płaszczyźnie XY
+            dist = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+
+            if dist <= radius:
+                # Tworzymy voxel na z=0
+                voxel = Voxel(x, y, z_val, rho, T1, T2, T2)  # T2* = T2 jako uproszczenie
+                fantom[(x, y, z_val)] = voxel
+            
+    return fantom
+
+def generate_ball(diameter, Px, Py, Pz):
+    """
+    Generuje fantom 3D składający się z kuli
+    
+    Zwraca:
+        fantom (dict): Mapa 3D voxelów { (x,y,z): Voxel }
+    """
+    # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
+    Voxel.dx = Voxel.FOVx / Px
+    Voxel.dy = Voxel.FOVy / Py
+    Voxel.dz = Voxel.FOVy / Pz  # Przyjmujemy FOVz = FOVy
+
+    # Tworzenie siatki 3D
+    x_vals = np.arange(0.0, Voxel.FOVx, Voxel.dx)
+    y_vals = np.arange(0.0, Voxel.FOVy, Voxel.dy)
+    z_vals = np.arange(0.0, Voxel.FOVy, Voxel.dz)
+
+    # Definiowanie kul
+    center = (x_vals[Px//2], y_vals[Py//2], z_vals[Pz//2])  # Środek kuli
+    radius = diameter/2# Promien kuli
+
+    # Wartości T1, T2, rho dla obu kul
+    T1, T2, rho = 300, 100, 1.0
+
+    # Inicjalizacja mapy voxelowej
+    fantom = {}
+
+    # Wypełnianie fantomu voxelami
+    for x in x_vals:
+        for y in y_vals:
+            for z in z_vals:
+                # Obliczanie odległości od środków kul
+                dist = np.sqrt((x - center[0])**2 + (y - center[1])**2 + (z - center[2])**2)
+
+                if dist <= radius:
+                    voxel = Voxel(x, y, z, rho, T1, T2, T2)  # T2* = T2 jako uproszczenie
+                    fantom[(x, y, z)] = voxel
+            
+    return fantom
+
+def generate_two_balls(size):
+    """
+    Generuje fantom 3D składający się z dwóch kul o różnych właściwościach T1, T2 i gęstości protonowej (rho).
+    
+    Zwraca:
+        fantom (dict): Mapa 3D voxelów { (x,y,z): Voxel }
+    """
+    # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
+    Voxel.dx = Voxel.FOVx / size
+    Voxel.dy = Voxel.FOVy / size
+    Voxel.dz = Voxel.FOVy / size  # Przyjmujemy FOVz = FOVy
+
+    # Tworzenie siatki 3D
+    x_vals = np.arange(-Voxel.FOVx / 2, Voxel.FOVx / 2, Voxel.dx)
+    y_vals = np.arange(-Voxel.FOVy / 2, Voxel.FOVy / 2, Voxel.dy)
+    z_vals = np.arange(-Voxel.FOVy / 2, Voxel.FOVy / 2, Voxel.dz)
+
+    # Definiowanie kul
+    center1 = (0.01, 0.01, 0.0)  # Środek pierwszej kuli
+    center2 = (-0.01, -0.01, 0.0)  # Środek drugiej kuli
+    radius1, radius2 = 0.01, 0.015  # Promienie kul
+
+    # Wartości T1, T2, rho dla obu kul
+    T1_1, T2_1, rho_1 = 300, 100, 1.0
+    T1_2, T2_2, rho_2 = 500, 200, 0.6
+
+    # Inicjalizacja mapy voxelowej
+    fantom = {}
+
+    # Wypełnianie fantomu voxelami
+    for x in x_vals:
+        for y in y_vals:
+            for z in z_vals:
+                # Obliczanie odległości od środków kul
+                dist1 = np.sqrt((x - center1[0])**2 + (y - center1[1])**2 + (z - center1[2])**2)
+                dist2 = np.sqrt((x - center2[0])**2 + (y - center2[1])**2 + (z - center2[2])**2)
+
+                if dist1 <= radius1:
+                    voxel = Voxel(x, y, z, rho_1, T1_1, T2_1, T2_1)  # T2* = T2 jako uproszczenie
+                    fantom[(x, y, z)] = voxel
+                elif dist2 <= radius2:
+                    voxel = Voxel(x, y, z, rho_2, T1_2, T2_2, T2_2)
+                    fantom[(x, y, z)] = voxel
+
+    return fantom
+
+def parallel_Grad_echo_x(voxels_set, num_workers=8, *args):
+    import multiprocessing as mp
+    from tqdm import tqdm
+
+    voxels_list = list(voxels_set.values())
+    num_voxels = len(voxels_list)
+    num_workers = min(num_workers, num_voxels)  # ograniczenie
+
+    # Podział danych
+    subfantoms = [{} for _ in range(num_workers)]
+    for i, voxel in enumerate(voxels_list):
+        subfantoms[i % num_workers][voxel.x, voxel.y, voxel.z] = voxel
+
+    tasks = [(subfantom, *args) for subfantom in subfantoms]
+
+    with mp.Pool(processes=num_workers) as pool:
+        results = []
+        with tqdm(total=num_workers + 1, desc="Processing") as pbar:
+            for task in tasks:
+                result = pool.apply_async(
+                    gradient_echo_x_axis,
+                    args=task,
+                    callback=lambda _: pbar.update(1)
+                )
+                results.append(result)
+            pool.close()
+            pool.join()
+
+            # sum tylko po tych, które nie są None
+            partial_results = [r.get() for r in results if r.get() is not None]
+            S = sum(partial_results)
+            pbar.update(1)
+
+    return S
 
 def parallel_GE_sequence(voxels_set, num_workers=8, *args):
     """
