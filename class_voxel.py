@@ -836,7 +836,7 @@ def show_S_image_experimental(S, TR, TE, T_RF,  Nx, Ny, sampling_frequency): #Ni
     plt.ylabel("Pozycja y (m)")
     plt.show()
 
-def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, Nx, Ny, sampling_frequency): #aby dzialalo trzeba ustawic dB = 0
+def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, Nx, Ny, sampling_frequency, bandwidth, FOVx, FOVy):
     """
     flip_angle - kąt obrotu wokół osi x w radianach
     slice_z - koordynata warstwy w osi z
@@ -851,87 +851,74 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
 
         Zwraca k-space
     """
-    T_read = Nx/sampling_frequency
+    T_read = Nx/bandwidth
     S = np.zeros((Nx, Ny), dtype=complex)
     frequency_RF = Voxel.gammaHz*(Voxel.B0 + Gzz*slice_z)
-    Gx = 30/(Voxel.FOVx*Voxel.gammaRad*0.002)
-    print(Gx)
-    amplitude_RF = flip_angle/(2*np.pi*Voxel.gammaHz * T_RF)#Dobrane tak, aby obrót był o flip_angle
-    T_dephase = T_read/2
-    coil_area = np.pi * (Voxel.coil_radius**2)  # Powierzchnia cewki
-    T_wait = TR - (T_RF + T_dephase + T_read)
-    coil_area = np.pi * (Voxel.coil_radius**2)  # Powierzchnia cewki
-    T_grad_y = TE - T_read - T_RF/2
-    base_Gy = 10*np.pi/(Voxel.FOVy*Voxel.gammaHz*T_grad_y)
+    Gx = bandwidth/(FOVx*Voxel.gammaHz)
+    amplitude_RF = flip_angle/(2*np.pi*Voxel.gammaHz * T_RF)
+    T_dephase = T_read/4
+    coil_area = np.pi * (Voxel.coil_radius**2)
+    T_grad_y = 0.001
+    Gymax = bandwidth/(FOVy*Voxel.gammaHz*T_grad_y) # Zgodnie z Twoim kodem: Gymax = bandwidth/(2*FOVy*Voxel.gammaHz*T_grad_y)
+    Gy = np.arange(-Gymax/2, Gymax/2, Gymax/Ny) # Zgodnie z Twoim kodem: Gy = np.arange(-Gymax/2, Gymax/2, Gymax/Ny)
 
-    """
-    print("frequency_RF: ",frequency_RF)
-    print("amplitude_RF: ",amplitude_RF)
-    """
-    print("T_grad_y: ",T_read)
-    """
-    print("T_read: ",T_read)
-    print("Gx: ",Gx)
-    print("base_Gy: ",base_Gy)
-    print("T_RF: ",T_RF)
-    print("T_dephase: ",T_dephase)
-    print("T_wait: ",T_wait)
-    print("TE: ",TE)
-    print("TR: ",TR)
-    """
-
-    for j in range(Ny):#główna pętla powtarzająca sygnał RF co czas TR
-        for voxel in voxels_set.values():#szybsza alternatywa dla T_wait
-            voxel.set_magnetization_in_direction(0.0, 0.0)
-        
-        Gy = base_Gy * j/Ny
-        n = 4000000
-        gradient(voxels_set, 0., 0.,Gzz)#gradient w z do wyboru warstwy
-        generate_RF_signal(voxels_set, frequency_RF, T_RF, amplitude_RF, n)
-        
-        #show_snapshot_3d(voxels_set, z_fixed=slice_z, y_fixed=0.004)
-        
-        Voxel.dt *= 10 #zmniejszam precyzję w mało kluczowych momentach
-        gradient(voxels_set, 0., Gy, 0.)#Gradient fazujący (w osi y) 
-        fast_long_precession(voxels_set, T_grad_y)
-        
-        gradient(voxels_set, -Gx, 0., 0.)#gradient defazujący w osi x
-        fast_long_precession(voxels_set, T_dephase)
-
-        gradient(voxels_set, Gx, 0., 0.)#Gradienty refazujące (w osi x) 
-        Voxel.dt /= 10 #zwiększam precyzję w waznych momentach
-
-        ### Zaczynamy pomiar!
-        total_flux = np.zeros(int(T_read/Voxel.dt)+1)
-
-        licznik = 0
-        for t in np.arange(0., T_read, Voxel.dt):
-            precession(voxels_set, t)
+    # --- Pasek postępu dla zewnętrznej pętli 'j' (kolumny k-space) ---
+    # Ten pasek będzie pokazywał, ile kolumn (j) zostało przetworzonych.
+    # Używamy `leave=False`, aby paski dla poszczególnych iteracji 'j' znikały,
+    # gdy kończy się ich przetwarzanie w wewnętrznej pętli.
+    with tqdm(total=Ny, desc=f"Proces {mp.current_process().name} - Kolumny k-space", unit="kolumna") as pbar_kolumna:
+        for j in range(Ny): # główna pętla powtarzająca sygnał RF co czas TR
             for voxel in voxels_set.values():
-                total_flux[licznik] += voxel.magnetization[0]*coil_area#sumuje składowe x magnetyzacji
-            licznik += 1
+                voxel.set_magnetization_in_direction(0.0, 0.0)
+            
+            n = 4000000
+            gradient(voxels_set, 0., 0.,Gzz)
+            generate_RF_signal(voxels_set, frequency_RF, T_RF, amplitude_RF, n)
+            
+            Voxel.dt *= 10
+            gradient(voxels_set, 0., Gy[j], 0.)
+            fast_long_precession(voxels_set, T_grad_y)
+            
+            gradient(voxels_set, -Gx, 0., 0.)
+            fast_long_precession(voxels_set, T_dephase)
 
-        V = -np.gradient(total_flux, Voxel.dt)  # Użycie kroku czasowego jako odstępu
-        V[len(V)-1] = 0 #ostatni element ustawiam sztucznie, bo nie ma następnego momentu czasu
-        V[len(V)-2] = 0 #same
-        #plt.plot(np.arange(len(V)), V)
-        #plt.show()
+            gradient(voxels_set, Gx, 0., 0.)
+            Voxel.dt /= 10
 
-        #próbkowanie V
-        DT = T_read/Nx
-        print("Progress: ", int(j/Ny*100), "%")
-        for i in range(Nx): #teraz mając FID idziemy po kolejnych t_x i aktualizujemy je
-            if int(i*DT/Voxel.dt) == len(V):
-                break
-            else:
-                S[i, j] += V[int(i*DT/Voxel.dt)] 
-        
-        """
-        Voxel.dt *= 10 #zmniejszam precyzję w mało kluczowych momentach
-        fast_long_precession(voxels_set, T_wait)
-        Voxel.dt /= 10 #zwiększam precyzję w waznych momentach
-        """
-    
+            ### Zaczynamy pomiar!
+            DT = 1/sampling_frequency
+            num_measurement_steps = int(T_read / DT) # Liczba próbek w pomiarze
+            V = np.zeros(num_measurement_steps, dtype=complex)
+            t = 0.0
+
+            # --- NOWOŚĆ: Pasek postępu dla wewnętrznej pętli 'i' (próbki pomiarowe) ---
+            # Ten pasek będzie pokazywał postęp wewnątrz każdej pojedynczej kolumny k-space.
+            # `leave=False` sprawi, że ten wewnętrzny pasek zniknie po ukończeniu bieżącej kolumny 'j'.
+            with tqdm(total=num_measurement_steps, desc=f"  Kolumna {j+1}/{Ny} - próbki", unit="próbka", leave=False, position=1) as pbar_probka:
+                for i in range(num_measurement_steps):
+                    total_flux = np.zeros(2)
+                    for voxel in voxels_set.values():
+                        total_flux[0] += voxel.magnetization[0]*coil_area
+                    precession(voxels_set)
+                    t += Voxel.dt
+                    for voxel in voxels_set.values():
+                        total_flux[1] += voxel.magnetization[0]*coil_area
+                    V[i] = -np.gradient(total_flux, Voxel.dt)[0]*np.exp(-2j*np.pi*Voxel.gammaHz*Voxel.B0*i*DT)
+                    fast_long_precession(voxels_set, (i+1)*DT-t)
+                    
+                    t = (i+1)*DT
+                    
+                    # --- Aktualizacja paska postępu dla próbek ---
+                    pbar_probka.update(1)
+
+            V_decimated = decimate(V, int(len(V)/Nx), ftype='fir', zero_phase=True)
+            V_decimated = V_decimated[:Nx]
+            S[:,j] += V_decimated
+            
+            # --- Aktualizacja paska postępu dla kolumn (zewnętrznego) ---
+            # Ten pasek zaktualizuje się dopiero po ukończeniu wszystkich próbek dla danej kolumny 'j'.
+            pbar_kolumna.update(1)
+            
     return S
 
 import cmath
@@ -1129,7 +1116,7 @@ def dB_noise_function(t):
     return 1e-6*Voxel.B0_real[int(t/Voxel.B0_data_dt)] - Voxel.B0
     #return 0.0
 
-def gradient_echo_y_axis(voxels_set, T_RF, Ny, flip_angle, slice_z, Gzz, sampling_frequency):
+def gradient_echo_y_axis(voxels_set, T_RF, Ny, flip_angle, slice_z, Gzz, sampling_frequency):#Nie zmieniana odkąd odkryłem, że grad echo x nie działa. Dlatego raczej nie działa
     DT = 1/sampling_frequency #tyle będzie trwało zbieranie V(t)
     S = np.zeros(Ny, dtype=complex)
     frequency_RF = Voxel.gammaHz*(Voxel.B0 + Gzz*slice_z)
@@ -1494,8 +1481,6 @@ def generate_circle(radius, center_x, center_y, Nx, Ny):
     # Ustalanie rozdzielczości voxelów na podstawie rozmiaru
     # Zakładamy, że Voxel.FOVx i Voxel.FOVy są zdefiniowane i reprezentują
     # rozmiar całego obszaru, w którym generowane są voxele.
-    center_x -= Voxel.FOVx/2
-    center_y -= Voxel.FOVy/2 #przesuwamy wszystko tak, aby do obliczeń było wycentrowane w (0, 0)
 
     Voxel.dx = Voxel.FOVx / Nx
     Voxel.dy = Voxel.FOVy / Ny
@@ -1652,40 +1637,44 @@ def parallel_GE_sequence(voxels_set, num_workers=8, *args):
     Wykonuje funkcję gradient_echo_sequence równolegle na podzielonych podzbiorach voxelów.
 
     Parametry:
-        voxels_set (list): Pełny zbiór voxelów.
-        num_workers (int): Liczba procesów równoległych (domyślnie 8).
+        voxels_set (dict): Pełny zbiór voxelów (słownik z kluczami (x, y, z)).
+        num_workers (int): Maksymalna liczba procesów równoległych (domyślnie 8).
         args: Pozostałe argumenty funkcji gradient_echo_sequence.
 
     Zwraca:
         Macierz S będąca sumą wyników z wszystkich podzbiorów.
     """
-    # Podział danych na 8 podzbiorów
-    subfantoms = []
-    for i in range(num_workers):
-        subfantoms.append({})
+    voxel_list = list(voxels_set.values())
+    num_voxels = len(voxel_list)
 
-    iterator = 0
-    for voxel in voxels_set.values():
-        subfantoms[iterator % num_workers][voxel.x, voxel.y, voxel.z] = voxel
-        iterator += 1
-    
-    # Przygotowanie argumentów dla starmap (każdy podzbiór dostaje te same dodatkowe argumenty)
+    # Ustal realną liczbę workerów
+    actual_workers = min(num_workers, num_voxels)
+
+    # Inicjalizuj podfantomy (każdy dla jednego workera)
+    subfantoms = [{} for _ in range(actual_workers)]
+
+    # Rozdziel voxele równomiernie na workerów
+    for i, voxel in enumerate(voxel_list):
+        subfantoms[i % actual_workers][(voxel.x, voxel.y, voxel.z)] = voxel
+
+    # Przygotuj zadania
     tasks = [(subfantom, *args) for subfantom in subfantoms]
 
-    # Uruchomienie obliczeń równoległych z paskiem postępu
-    with mp.Pool(processes=num_workers) as pool:
+    # Uruchom obliczenia równolegle
+    with mp.Pool(processes=actual_workers) as pool:
         results = []
-        with tqdm(total=num_workers + 1, desc="Processing") as pbar:
+        with tqdm(total=actual_workers + 1, desc="Kończenie zadań workerów") as pbar: # Ten pasek śledzi ukończenie całych zadań workerów
             for task in tasks:
+                # Callback pbar.update(1) tutaj będzie aktualizował ten 'master' pasek
+                # gdy worker zakończy swoje całe zadanie.
                 result = pool.apply_async(gradient_echo_sequence, args=task, callback=lambda _: pbar.update(1))
                 results.append(result)
             pool.close()
             pool.join()
             S = sum(result.get() for result in results)
-            pbar.update(1)  # Update for the final step of saving the matrix
-    
-    return S
+            pbar.update(1)  # Finalny update paska postępu dla mastera
 
+    return S
 def show_fantom(voxels_set):
     fantom = voxels_set
     import plotly.graph_objects as go
