@@ -5,23 +5,24 @@ co mam w rzeczywistych pomiarach. Również rozdzielczość
 import matplotlib.pyplot as plt
 import numpy as np
 import csv
-from class_voxel import Voxel, gradient_echo_sequence, generate_circle, show_fantom, show_rho_2D, show_S_image, parallel_GE_sequence, gradient_echo_x_axis, parallel_Grad_echo_x, create_single_voxel_fantom
+from class_voxel import Voxel, gradient_echo_sequence, generate_circle, show_fantom, show_rho_2D, show_S_image, parallel_GE_sequence, gradient_echo_x_axis, parallel_Grad_echo_x, create_single_voxel_fantom, import_real_B0_field
 
 TR = 0.8
 TE = 200 * 1e-3 #(pierwsza liczba to ms)
 bandwidth = 32
 T_RF = 10*1e-3
-flip_angle = 35*np.pi/180 
+flip_angle = 90*np.pi/180 
 slice_z = 0.0  # Położenie wybranej płaszczyzny w osi Z
 Gzz = 0.1
 RF_amplitude = 3.67 * 1e-6  # Amplituda RF w Teslach
 Nx = 32  # Liczba punktów pomiarowych w osi X
 Ny = 32  # Liczba punktów pomiarowych w osi Y
-FOVx = 120*1e-3 
-FOVy = 120 *1e-3
+FOVx = 80*1e-3 
+FOVy = 80 *1e-3
 sampling_frequency = 7000
-nazwa_pomiaru = "Pomiar_XY_32x32_2"
+nazwa_pomiaru = "Pomiar_XY_32x32_do_rozdz_5_nr_2_real_tylko_os_z"
 file_name = f"{nazwa_pomiaru}.txt"
+import_real_B0_field("/Users/jandobrakowski/Documents/Studia/B0_field.csv")
 
 # Open the file in write mode ('w')
 with open(file_name, 'w') as file:
@@ -51,10 +52,9 @@ fantom.update(kolo2)
 #show_rho_2D(fantom, 0.0, Nx, Ny)
 
 if __name__ == "__main__":
-    # S = parallel_GE_sequence(fantom, 8,TR, TE, T_RF, flip_angle, slice_z, Gzz,Nx, Ny, sampling_frequency, bandwidth, FOVx, FOVy)
-    # np.save(f"{nazwa_pomiaru}.npy", S)
-#     S = gradient_echo_x_axis(fantom, T_RF, Nx, flip_angle, slice_z, Gzz, sampling_frequency,bandwidth, FOVx)
-#     np.save("S_pomiar_x.npy", S)
+    S = parallel_GE_sequence(fantom, 8,TR, TE, T_RF, flip_angle, slice_z, Gzz,Nx, Ny, sampling_frequency, bandwidth, FOVx, FOVy)
+    np.save(f"{nazwa_pomiaru}.npy", S)
+
     # S = parallel_Grad_echo_x(fantom, 8, T_RF, Nx, flip_angle, slice_z, Gzz, sampling_frequency,bandwidth, FOVx)
     # np.save("S_parallel_FOV120_x.npy", S)
     #show_S_image(S, TR, TE, T_RF, Nx, Ny, sampling_frequency)
@@ -72,8 +72,11 @@ if __name__ == "__main__":
     # plt.show()
     
     k_space = np.load(f"{nazwa_pomiaru}.npy")
+    window_x = np.hanning(Nx)
+    window_y = np.hanning(Ny)
+    S_windowed = k_space * window_x[:, None] * window_y[None, :]
+    k_space = S_windowed
     image = np.fft.fftshift(np.fft.fft2(k_space))
-    absolute_image = np.abs(image)
     #print(matrix1)
     
     plt.figure(figsize=(6, 6))
@@ -84,4 +87,8 @@ if __name__ == "__main__":
     plt.xlabel('Oś X [cm]')
     plt.ylabel('Oś Y [cm]')
     plt.tight_layout()
+    # Zapis do formatu PDF (wektorowego)
+    plt.savefig(f"{nazwa_pomiaru}.pdf", format="pdf", bbox_inches="tight")
     plt.show()
+
+    
