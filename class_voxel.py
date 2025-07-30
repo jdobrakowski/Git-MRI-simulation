@@ -35,9 +35,6 @@ class Voxel:
     dy = 0.5*1e-2 #Wartość w metrach.
     dz = 0.5*1e-2 #Wartość w metrach.
 
-    #Pasmo odbiornika
-    BW = 64 #Pasmo odbiornika w Hz
-
     #Promień cewki odbiorczej
     coil_radius = 3*1e-2 #3 cm
 
@@ -139,20 +136,30 @@ def f(M, B, M0, T1, T2, gammaHz, dt):
     return result * dt
 
 @njit
-def precession_numba_time(magnetization, B, previous_B, M0, T1, T2, gammaRad, dt, time):
+def precession_numba_time(magnetization, B0, B, B0_real,B0_real_dt, t_start, previous_B, M0, T1, T2, gammaRad, dt, time):
     """
     Funkcja wykonująca precesję magnetyzacji dla wszystkich wokseli sekwencyjnie.
     """
     num_voxels = magnetization.shape[0]  # Liczba wokseli
     for t in time:
+        #najpierw wyliczam dodatek płynący ze zmiany pola 
+        #B_prev i B_next to wartości z tablicy B0_real następujące przed momentem t i po nim
+        #indeks 0 w tablicy B0_real odpowiada indeksowi int(t_start/B0_real_dt) w tablicy Voxel.B0_real (globalnej)
+        index = int((t+t_start)/B0_real_dt) - int(t_start/B0_real_dt)
+        B_prev = B0_real[:,index] # moment czasowy = index*B0_real_dt
+        B_next = B0_real[:,index + 1]
+        B_real = ((t-index*B0_real_dt)*B_next + (B0_real_dt - t + index*B0_real_dt)*B_prev)/B0_real_dt
+        
+        B_noise = B_real - B0
+        
         for i in range(num_voxels):  # Przetwarzanie sekwencyjne
             M = magnetization[i]
-            B_now = B[i]
-            B_prev = previous_B[i]
+            B_now = B[i] + B_noise
+            B_pre = B_now#wydaje mi się że w tej funkcji podział na B_pre i B_now nie ma sensu
 
-            k1 = f(M, B_prev, M0[i], T1[i], T2[i], gammaRad, dt)
-            k2 = f(M + 0.5 * k1, (B_now + B_prev) / 2, M0[i], T1[i], T2[i], gammaRad, dt)
-            k3 = f(M + 0.5 * k2, (B_now + B_prev) / 2, M0[i], T1[i], T2[i], gammaRad, dt)
+            k1 = f(M, B_pre, M0[i], T1[i], T2[i], gammaRad, dt)
+            k2 = f(M + 0.5 * k1, (B_now + B_pre) / 2, M0[i], T1[i], T2[i], gammaRad, dt)
+            k3 = f(M + 0.5 * k2, (B_now + B_pre) / 2, M0[i], T1[i], T2[i], gammaRad, dt)
             k4 = f(M + k3, B_now, M0[i], T1[i], T2[i], gammaRad, dt)
 
             # Nowa wartość magnetyzacji
@@ -160,7 +167,7 @@ def precession_numba_time(magnetization, B, previous_B, M0, T1, T2, gammaRad, dt
 
     return magnetization
 
-def fast_long_precession(voxels_set, T):
+def fast_precession(voxels_set, T, t_start):
     """
     Funkcja wywołująca przyspieszoną wersję `precession_numba` na wokselach.
 
@@ -170,6 +177,7 @@ def fast_long_precession(voxels_set, T):
     # Tworzymy macierze NumPy dla magnetyzacji, pola B i parametrów
     magnetization = np.array([voxel.magnetization for voxel in voxels_set.values()])
     B = np.array([voxel.B for voxel in voxels_set.values()])
+    B0_real = Voxel.B0_real[:,int(t_start/Voxel.B0_data_dt):int((t_start+T)/Voxel.B0_data_dt+1)] #ale nie wszystkie tylko odpowiednie okno
     previous_B = np.array([voxel.previous_B for voxel in voxels_set.values()])
     M0 = np.array([voxel.M0 for voxel in voxels_set.values()])
     T1 = np.array([voxel.T1 for voxel in voxels_set.values()])
@@ -180,7 +188,8 @@ def fast_long_precession(voxels_set, T):
     dt = Voxel.dt
     time = np.arange(0., T, dt)
     # Uruchomienie przyspieszonej wersji z Numbą (sekwencyjnie)
-    magnetization = precession_numba_time(magnetization, B, previous_B, M0, T1, T2, gammaRad, dt, time)
+    #print("Args:", magnetization,Voxel.B0_real[0], B, B0_real, Voxel.B0_data_dt,t_start,previous_B, M0, T1, T2, gammaRad, dt, time)
+    magnetization = precession_numba_time(magnetization,Voxel.B0_real[:,0], B, B0_real, Voxel.B0_data_dt,t_start,previous_B, M0, T1, T2, gammaRad, dt, time)
     
     # Przypisanie nowych wartości magnetyzacji do obiektów Voxel
     for i, voxel in enumerate(voxels_set.values()):
@@ -473,7 +482,7 @@ def generate_RF_signal(voxels_set, frequency, time_length, amplitude, n_snapshot
             print("Czas: ", f'{t*1000*n_snapshots:.2f}', "ms")
         """
 
-        precession(voxels_set)
+        fast_precession(voxels_set, Voxel.dt, t)
 
         
         if iterator %n_snapshots == 0:
@@ -860,8 +869,8 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
     coil_area = np.pi * (Voxel.coil_radius**2)
     T_grad_y = 0.001
     Gymax = bandwidth/(FOVy*Voxel.gammaHz*T_grad_y) # Zgodnie z Twoim kodem: Gymax = bandwidth/(2*FOVy*Voxel.gammaHz*T_grad_y)
-    Gy = np.arange(-Gymax/2, Gymax/2, Gymax/Ny) # Zgodnie z Twoim kodem: Gy = np.arange(-Gymax/2, Gymax/2, Gymax/Ny)
-
+    Gy = np.linspace(-Gymax/2, Gymax/2, Ny) # Zgodnie z Twoim kodem: Gy = np.arange(-Gymax/2, Gymax/2, Gymax/Ny)
+    time = 0.0
     # --- Pasek postępu dla zewnętrznej pętli 'j' (kolumny k-space) ---
     # Ten pasek będzie pokazywał, ile kolumn (j) zostało przetworzonych.
     # Używamy `leave=False`, aby paski dla poszczególnych iteracji 'j' znikały,
@@ -874,13 +883,13 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
             n = 4000000
             gradient(voxels_set, 0., 0.,Gzz)
             generate_RF_signal(voxels_set, frequency_RF, T_RF, amplitude_RF, n)
-            
+            time += T_RF
             Voxel.dt *= 10
             gradient(voxels_set, 0., Gy[j], 0.)
-            fast_long_precession(voxels_set, T_grad_y)
-            
+            fast_precession(voxels_set, T_grad_y, time)
+            time += T_grad_y
             gradient(voxels_set, -Gx, 0., 0.)
-            fast_long_precession(voxels_set, T_dephase)
+            fast_precession(voxels_set, T_dephase, time)
 
             gradient(voxels_set, Gx, 0., 0.)
             Voxel.dt /= 10
@@ -899,13 +908,14 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
                     total_flux = np.zeros(2)
                     for voxel in voxels_set.values():
                         total_flux[0] += voxel.magnetization[0]*coil_area
-                    precession(voxels_set)
+                    fast_precession(voxels_set, Voxel.dt, time)
+                    time += Voxel.dt
                     t += Voxel.dt
                     for voxel in voxels_set.values():
                         total_flux[1] += voxel.magnetization[0]*coil_area
                     V[i] = -np.gradient(total_flux, Voxel.dt)[0]*np.exp(-2j*np.pi*Voxel.gammaHz*Voxel.B0*i*DT)
-                    fast_long_precession(voxels_set, (i+1)*DT-t)
-                    
+                    fast_precession(voxels_set, (i+1)*DT-t, time)
+                    time += (i+1)*DT-t
                     t = (i+1)*DT
                     
                     # --- Aktualizacja paska postępu dla próbek ---
@@ -918,8 +928,10 @@ def gradient_echo_sequence(voxels_set, TR, TE, T_RF, flip_angle, slice_z, Gzz, N
             # --- Aktualizacja paska postępu dla kolumn (zewnętrznego) ---
             # Ten pasek zaktualizuje się dopiero po ukończeniu wszystkich próbek dla danej kolumny 'j'.
             pbar_kolumna.update(1)
-            
-    return S
+    window_x = np.hanning(Nx)
+    window_y = np.hanning(Ny)
+    S_windowed = S * window_x[:, None] * window_y[None, :]      
+    return S_windowed
 
 import cmath
 
@@ -1069,16 +1081,25 @@ def load_k_space_to_matrix(file_path):
 
 def import_real_B0_field(file_path):
     """
-    importuje plik .csv z rzeczywistym polem B0
+    Importuje plik .csv z rzeczywistym polem B0.
+    Zakłada, że kolumny to: Magnetic Field x/y/z (µT)
     """
     import pandas as pd
-    # Importowanie danych z pliku CSV
-    data = pd.read_csv(file_path)
-    B0_real = data["Absolute field (µT)"]
-    Voxel.B0_real = B0_real[100:]#usuwam pierwsze 100 elementów, poniewaz roznia sie znaczaco or reszty
-    Voxel.B0_real = Voxel.B0_real.reset_index(drop=True)
-    #Voxel.B0_real = B0_real[:100]#pozostawiam jedynie 100 elementów, bo do reszty i tak nie dojdzie
+    import numpy as np
 
+    # Wczytanie danych jako DataFrame
+    data = pd.read_csv(file_path)
+
+    # Zamiana wybranych kolumn na NumPy array (3×N)
+    B0_real = np.array([
+        data["Magnetic Field x (µT)"].to_numpy(),
+        data["Magnetic Field y (µT)"].to_numpy(),
+        data["Magnetic Field z (µT)"].to_numpy()
+    ])
+
+    # Usunięcie pierwszych 1000 próbek
+    Voxel.B0_real = B0_real[:, 1000:]*1e-6
+    Voxel.B0 = np.linalg.norm(Voxel.B0_real[:,0])
 #@njit
 def dB_noise_function(t):
     """
